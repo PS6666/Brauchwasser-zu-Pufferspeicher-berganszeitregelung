@@ -1,0 +1,1262 @@
+# ===================================================================================
+# AUTOMATISCHE ANLAGENSTEUERUNG – DER UNIVERSELLE CODE-STANDARD (FINALES BACKUP)
+# ===================================================================================
+
+# --- GLOBALE ZAHLENSPEICHER FÜR DIE BERECHNETEN TAGESMINUTEN (CPU-ENTLASTUNG) ---
+globals:
+  - id: lade_von_min
+    type: int
+    initial_value: "690"  # 11:30 Uhr in Minuten
+  - id: lade_bis_min
+    type: int
+    initial_value: "990"  # 16:30 Uhr in Minuten
+  - id: entlade_von_min
+    type: int
+    initial_value: "330"  # 05:30 Uhr in Minuten
+  - id: entlade_bis_min
+    type: int
+    initial_value: "450"  # 07:30 Uhr in Minuten
+  - id: sensor_reboot_count
+    type: int
+    restore_value: yes
+    initial_value: "0"
+  - id: sensor_hard_fault
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+    
+# --- ZENTRALE HARDWARE-, NETZWERK- & REGELUNGS-KONSTANTEN ---
+substitutions:
+  # 1. Physische GPIO-Pinbelegung (Exakt nach dem Pinout-Diagramm)
+  pin_bus_bw: "GPIO4"            # Äußerer Board-Aufdruck: Pin 4
+  pin_bus_puf_ob: "GPIO5"        # Äußerer Board-Aufdruck: Pin 5
+  pin_bus_puf_unt: "GPIO6"       # Äußerer Board-Aufdruck: Pin 6
+  pin_bus_hk_vl: "GPIO7"         # Äußerer Board-Aufdruck: Pin 7
+  pin_bus_hk_rl: "GPIO8"         # Äußerer Board-Aufdruck: Pin 8
+  pin_bus_kes: "GPIO9"           # Äußerer Board-Aufdruck: Pin 9
+  pin_bus_hk2_vl: "GPIO10"       # Äußerer Board-Aufdruck: Pin 10
+  pin_bus_hk2_rl: "GPIO11"       # Äußerer Board-Aufdruck: Pin 11
+  
+  # Variables Abfrage-Intervall für alle Sensoren und Berechnungen
+  sensor_intval_time: "5000ms"   # Sensoren abfrage intervall
+  
+  # Relais-Pins (Platzierung auf den Klemmen der rechten oberen Board-Seite)
+  pin_relais_1: "GPIO1"          # Äußerer Board-Aufdruck: Pin 1 (Ladepumpe)
+  pin_relais_2: "GPIO2"          # Äußerer Board-Aufdruck: Pin 2 (ESBE-Widerstand)
+  pin_relais_3: "GPIO12"         # Äußerer Board-Aufdruck: Pin 12 (Feuerungsfreigabe)
+  
+  # 2. Logische Namen & Hardware-Eigenschaften
+  sensor1_bw: "Brauchwassertemperatur"
+  sensor2_puf_ob: "Pufferspeicher oben"
+  sensor3_puf_unt: "Pufferspeicher unten"
+  sensor4_hk_vl: "Heizkreis vorlauf"
+  sensor5_hk_rl: "Heizkreis rücklauf"
+  sensor6_kes: "Kessel Temperatur"
+  sensor7_hk2_vl: "Wohnen2 vorlauf" 
+  sensor8_hk2_rl: "Wohnen2 rücklauf"
+  
+  bwsp_vol: "300"                # Brauchwasserspeichervolumen in Liter
+  puffsp_vol: "800"              # Pufferspeichervolumen in Liter
+  bw_max_lad: "65"               # Brauchwasser Maximaltemperatur
+  puff_max_lad: "75"             # Pufferspeicher Maximaltemperatur
+  win_puff_ob: "45"              # Wintermodus Ladestart für Brauchwasser
+  
+  relais_1_name: "Ladepumpe"     
+  relais_2_name: "ESBE 95-1 Komfort Widerstand" 
+  relais_3_name: "Feuerungsfreigabe"
+  tasmota_ip_fest: "192.168.200.106"
+  tasmota_realname: "ESBE95-1 Hauptstrom Nous A8T" 
+  zeitserver1: "fritz.box"
+  
+  # 3. Zentrale Logik-Umkehr für Low-Level-Relaisplatinen
+  relais_invertiert: "true"      # 'false' für High-Level, 'true' für Low-Level
+
+  # 4. Zentrale Taktung & Hardware-Parameter
+  regel_takt: "5s"               # Intervall-Takt des Hauptreglers
+  pumpe_min_on_ms: "30000"       # Mindestlaufzeit der Ladepumpe in ms (30 Sek.)
+  puffer_max_wert: "75"          # Maximale Schutztemperatur Pufferspeicher in °C
+  status_led_pin: "GPIO48"       # Pin der internen Board-RGB-LED zum Deaktivieren
+
+  # 5. Zentraler Standard-Volumenstrom für die Alpha 2 (bei ca. 11 Watt / AUTOADAPT)
+  mitt_durchfl: "600"            # Mittlerer Durchfluss in Liter pro Stunde (l/h)
+  woh2_mitt_durchfluss: "200"
+  
+# --- S3 STATUS LED AUSSCHALTUNG ---
+status_led:
+  pin:
+    number: ${status_led_pin}
+    inverted: true  
+
+# --- SYSTEM-START-PRIORISIERUNG ---
+esphome:
+  name: diffsteuerung
+  friendly_name: "Steuerung Überganszeit"
+  on_boot:
+    priority: -100.0         # Wartet, bis WLAN und Sensoren stabil laufen
+    then:
+      - delay: 5s            # Erhöht auf 5s, um neuen Sensoren Zeit zum Starten zu geben
+      - script.execute: pruefe_hauptsensoren
+
+# --- HARDWARE-ARCHITEKTUR ---
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  id: "status_led_board"
+  framework:
+    type: esp-idf
+    
+api:
+  encryption:
+    key: 0/GTBGTdpcgjyc2maLUYUvQs0caz97Ikfb9IF2crpUc=
+  reboot_timeout: 30min
+  
+# --- NETZWERK-KONFIGURATION ---
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: NONE
+  domain: .local
+  reboot_timeout: 30min
+  manual_ip:
+    static_ip: 192.168.200.45
+    gateway: 192.168.200.1
+    subnet: 255.255.255.0
+    dns1: 192.168.200.1
+    
+mdns:
+  disabled: false
+
+# --- MQTT SETUP ---
+mqtt:
+  id: mqtt_client                     
+  broker: !secret mqtt_host
+  port: !secret mqtt_port
+  username: !secret mqtt_username
+  password: !secret mqtt_password   
+  client_id: "esp32s3_diffsteuerung" 
+  topic_prefix: "esphome/diff_steuerung"
+  discovery: true
+  discovery_prefix: homeassistant
+  reboot_timeout: 30min
+
+ota:
+  - platform: esphome
+    encryption:
+  - platform: web_server
+
+# --- DALLAS HARDWARE DIAGNOSE-LOGGING ---
+logger:
+  level: DEBUG
+  logs:
+    component: INFO
+    mqtt: INFO
+    wifi: INFO
+    dallas.sensor: DEBUG
+    dallas_temp.sensor: DEBUG
+
+# --- DIESEN BLOCK HINZUFÜGEN (Behebt den Fehler) ---
+http_request:
+  timeout: 5s
+  verify_ssl: false
+  
+# --- MODERNER V3 WEBSERVER ---
+web_server:
+  port: 80
+  version: 3
+  local: false
+  sorting_groups:
+    - id: group_main
+      name: "📊 Hauptmenü"
+    - id: group_manual
+      name: "🕹️ Handbetrieb"
+    - id: group_setup
+      name: "⚙️ Einstellungen"
+    - id: group_system
+      name: "🛠️ System"
+
+# --- SYSTEMZEIT (NTP) ---
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Europe/Berlin"   
+    servers:
+      - ${zeitserver1}
+    update_interval: 21600s    
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 3
+        days_of_week: SUN
+        then:
+          - logger.log: "Wöchentlicher Speicher-Sicherheitsneustart eingeleitet..."
+          - delay: 2s
+          - button.press: system_reboot
+
+# --- LIVE-TEXT-SENSOREN FÜR DIE WEB-UI (REIHENFOLGE KORRIGIERT) ---
+text_sensor:
+  - platform: template
+    name: "Aktuelle Uhrzeit"
+    id: uhrzeit_display
+    icon: "mdi:clock-outline"
+    update_interval: 1s         
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 1         # 1. Platz: Ganz oben
+    lambda: |-
+      auto time_now = id(sntp_time).now();
+      if (!time_now.is_valid()) return {"Warte auf NTP..."};
+      static char buffer[32];   
+      snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d Uhr", 
+               time_now.hour, time_now.minute, time_now.second);
+      return {buffer};
+      
+  - platform: template
+    name: "Heizung Statusmeldung"
+    id: heizung_statusmeldung
+    icon: "mdi:information-outline"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 2         # 2. Platz: Direkt unter der Uhrzeit
+    lambda: |-
+      if (id(sensor_hard_fault)) {
+        return {"Störung, Sensor defekt bitte Prüfen"};
+      }
+
+      if (!id(regelung_aktiv).state) {
+        return {"Anlage Ausgeschaltet (Standby)"};
+      }
+
+      // =================================================================
+      // WINTERBETRIEB
+      // =================================================================
+      if (id(winterbetrieb_schalter).state) {
+        if (id(relais_1).state) {
+          return {"Winterbetrieb: Pufferladung aktiv"};
+        }
+        
+        std::string pause_state = id(winter_pause_restzeit).state;
+        if (pause_state == "Puffer kalt") {
+          return {"Winterbetrieb: Warten auf Pufferladung (Kessel kalt)"};
+        } else {
+          return {"Winterbetrieb: Bereitschaft (Warm genug)"};
+        }
+      }
+      
+      // =================================================================
+      // ÜBERGANGSBETRIEB
+      // =================================================================
+      auto time_now = id(sntp_time).now();
+      int aktuelle_minuten = (time_now.hour * 60) + time_now.minute;
+      
+      if (time_now.is_valid() && aktuelle_minuten >= id(entlade_von_min) && aktuelle_minuten < id(entlade_bis_min)) {
+        if (id(relais_2).state) {
+          return {"Übergangsbetrieb: Puffer Entladung aktiv"};
+        } else {
+          return {"Übergangsbetrieb: Warmwasserschutz greift (Pufferleerung blockiert)"};
+        }
+      }
+      
+      if (time_now.is_valid() && aktuelle_minuten >= id(lade_von_min) && aktuelle_minuten < id(lade_bis_min)) {
+        if (id(relais_1).state) {
+          return {"Übergangsbetrieb: Solarumladung zu Puffer"};
+        } else {
+          return {"Übergangsbetrieb: Ladefenster aktiv (Warten auf Solarertrag)"};
+        }
+      }
+      
+      return {"Übergangsbetrieb: Bereitschaft (Standby)"};
+
+  - platform: template
+    name: "Winter-Pause Restzeit"
+    id: winter_pause_restzeit
+    icon: "mdi:timer-sand"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 3         # 3. Platz: Direkt unter der Statusmeldung
+
+  # --- GPIO-PIN ANZEIGEN (Ab hier unverändert mit hohem Gewicht für das Setup) ---
+  - platform: template
+    name: "Pin Brauchwasserspeicher"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 65        
+    lambda: 'return {"${pin_bus_bw}"};'
+
+  - platform: template
+    name: "Pin Pufferspeicher oben"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 66        
+    lambda: 'return {"${pin_bus_puf_ob}"};'
+
+  - platform: template
+    name: "Pin Pufferspeicher unten"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 67        
+    lambda: 'return {"${pin_bus_puf_unt}"};'
+
+  - platform: template
+    name: "Pin Heizkreis vorlauf"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 68        
+    lambda: 'return {"${pin_bus_hk_vl}"};'
+
+  - platform: template
+    name: "Pin Heizkreis rücklauf"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 69        
+    lambda: 'return {"${pin_bus_hk_rl}"};'
+
+  - platform: template
+    name: "Pin Kessel Temperatur"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 70        
+    lambda: 'return {"${pin_bus_kes}"};'
+
+  - platform: template
+    name: "Pin Wohnen2 vorlauf"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 71        
+    lambda: 'return {"${pin_bus_hk2_vl}"};'
+
+  - platform: template
+    name: "Pin Wohnen2 rücklauf"
+    icon: "mdi:serial-port"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 72        
+    lambda: 'return {"${pin_bus_hk2_rl}"};'
+
+  - platform: template
+    name: "Pin Relais 1 Ladepumpe"
+    icon: "mdi:electric-switch"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 75        
+    lambda: 'return {"${pin_relais_1} -> ${relais_1_name}"};'
+
+  - platform: template
+    name: "Pin Relais 2 Komfort-Widerstand"
+    icon: "mdi:electric-switch"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 76        
+    lambda: 'return {"${pin_relais_2} -> ${relais_2_name}"};'
+    
+  - platform: template
+    name: "Feuerungsfreigabe"
+    icon: "mdi:electric-switch"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 77        
+    lambda: 'return {"${pin_relais_3} -> ${relais_3_name}"};'
+    
+  - platform: template
+    name: "Netzwerkadresse Tasmota"
+    icon: "mdi:ip-network"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 78        
+    lambda: 'return {"${tasmota_ip_fest} (${tasmota_realname})"};'
+
+# --- INITIALISIERUNG DER 8 SEPARATEN BUS-LEITUNGEN MIT AKTIVEM PULLUP ---
+one_wire:
+  - platform: gpio
+    id: bus_bw
+    pin: 
+      number: ${pin_bus_bw}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_puf_ob
+    pin: 
+      number: ${pin_bus_puf_ob}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_puf_unt
+    pin: 
+      number: ${pin_bus_puf_unt}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_hk_vl
+    pin: 
+      number: ${pin_bus_hk_vl}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_hk_rl
+    pin: 
+      number: ${pin_bus_hk_rl}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_kes
+    pin: 
+      number: ${pin_bus_kes}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_hk2_vl
+    pin: 
+      number: ${pin_bus_hk2_vl}
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: bus_hk2_rl
+    pin: 
+      number: ${pin_bus_hk2_rl}
+      mode: INPUT_PULLUP
+
+# --- STATUSPUNKTE (FARBIG) FÜR DAS HAUPTMENÜ ---
+binary_sensor:
+  - platform: template
+    name: "Status: Ladepumpe"
+    id: status_relais_1
+    icon: "mdi:pump"
+    device_class: running       
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 16        
+    lambda: "return id(relais_1).state;"
+
+  - platform: template
+    name: "Status: ESBE Komfort Widerstand"
+    id: status_relais_2
+    icon: "mdi:heating-coil"
+    device_class: running
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 17        
+    lambda: "return id(relais_2).state;"
+
+  - platform: template
+    name: "Status: ESBE Hauptstrom (Tasmota)"
+    id: status_tasmota
+    icon: "mdi:power-socket-de"
+    device_class: running
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 18        
+    lambda: "return id(ak2_tasmota).state;"
+    
+  - platform: template
+    name: "Status: Feuerungsfreigabe"
+    id: status_relais_3
+    icon: "mdi:fire-check"
+    device_class: running
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 19        
+    lambda: "return id(relais_3).state;"
+
+# --- CODESYSTEM FÜR FLEXIBLE ZEITEINSTELLUNGEN ---
+text:
+  - platform: template
+    name: "Solar-Ladefenster Start"
+    id: ui_lade_start
+    initial_value: "11:30"
+    mode: text
+    min_length: 5
+    max_length: 5
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 51
+    on_value:
+      then:
+        - lambda: |-
+            int h = 0, m = 0;
+            if (sscanf(x.c_str(), "%d:%d", &h, &m) == 2) {
+              id(lade_von_min) = (h * 60) + m;
+            }
+
+  - platform: template
+    name: "Solar-Ladefenster Ende"
+    id: ui_lade_stop
+    initial_value: "16:30"
+    mode: text
+    min_length: 5
+    max_length: 5
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 52
+    on_value:
+      then:
+        - lambda: |-
+            int h = 0, m = 0;
+            if (sscanf(x.c_str(), "%d:%d", &h, &m) == 2) {
+              id(lade_bis_min) = (h * 60) + m;
+            }
+
+  - platform: template
+    name: "Entladefenster Start"
+    id: ui_entlade_start
+    initial_value: "05:30"
+    mode: text
+    min_length: 5
+    max_length: 5
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 53
+    on_value:
+      then:
+        - lambda: |-
+            int h = 0, m = 0;
+            if (sscanf(x.c_str(), "%d:%d", &h, &m) == 2) {
+              id(entlade_von_min) = (h * 60) + m;
+            }
+
+  - platform: template
+    name: "Entladefenster Ende"
+    id: ui_entlade_stop
+    initial_value: "07:30"
+    mode: text
+    min_length: 5
+    max_length: 5
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 54
+    on_value:
+      then:
+        - lambda: |-
+            int h = 0, m = 0;
+            if (sscanf(x.c_str(), "%d:%d", &h, &m) == 2) {
+              id(entlade_bis_min) = (h * 60) + m;
+            }
+
+# --- SENSOR-BEREICH (PLUG & PLAY ÜBER INDEX 0 GEWÄHRLEISTET) ---
+sensor:
+  - platform: dallas_temp
+    one_wire_id: bus_bw
+    index: 0                    
+    id: sensor_brauchwasser
+    filters:
+      - filter_out: NAN 
+    name: ${sensor1_bw}   
+    update_interval: ${sensor_intval_time}        
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 4         
+
+  - platform: dallas_temp
+    one_wire_id: bus_puf_ob
+    index: 0                    
+    id: sensor_puffer_oben
+    filters:
+      - filter_out: NAN     
+    name: ${sensor2_puf_ob}    
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 5         
+
+  - platform: dallas_temp
+    one_wire_id: bus_puf_unt
+    index: 0                    
+    id: sensor_puffer_unten
+    filters:
+      - filter_out: NAN     
+    name: ${sensor3_puf_unt} 
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 6         
+
+  - platform: dallas_temp
+    one_wire_id: bus_hk_vl
+    index: 0                    
+    id: sensor_hk_vl
+    filters:
+      - filter_out: NAN     
+    name: ${sensor4_hk_vl}
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 7         
+
+  - platform: dallas_temp
+    one_wire_id: bus_hk_rl
+    index: 0                    
+    id: sensor_hk_rl
+    filters:
+      - filter_out: NAN     
+    name: ${sensor5_hk_rl}
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 8         
+
+  - platform: dallas_temp
+    one_wire_id: bus_kes
+    index: 0                    
+    id: sensor_kessel
+    filters:
+      - filter_out: NAN     
+    name: ${sensor6_kes}
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 9         
+
+  - platform: dallas_temp
+    one_wire_id: bus_hk2_vl
+    index: 0                    
+    id: sensor_hk2_vl
+    filters:
+      - filter_out: NAN     
+    name: ${sensor7_hk2_vl}
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 10         
+
+  - platform: dallas_temp
+    one_wire_id: bus_hk2_rl
+    index: 0                    
+    id: sensor_hk2_rl
+    filters:
+      - filter_out: NAN     
+    name: ${sensor8_hk2_rl}
+    update_interval: ${sensor_intval_time}
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 11         
+
+  # --- Prozent-Ladestandsanzeigen ---
+  - platform: template
+    name: "Brauchwasser-Ladestatus"
+    id: brauchwasser_ladestatus
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:battery-charging-60"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 12        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(sensor_brauchwasser).has_state()) return {};
+      float t_aktuell = id(sensor_brauchwasser).state;
+      float t_max = ${bw_max_lad};
+      float t_basis = 18.0f; 
+      if (t_aktuell <= t_basis) return 0.0f;
+      if (t_aktuell >= t_max) return 100.0f;
+      return ((t_aktuell - t_basis) / (t_max - t_basis)) * 100.0f;
+
+  - platform: template
+    name: "Pufferspeicher-Ladestatus"
+    id: pufferspeicher_ladestatus
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:battery-charging-80"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 13        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(sensor_puffer_oben).has_state() || !id(sensor_puffer_unten).has_state()) return {};
+      float t_mittel = (id(sensor_puffer_oben).state + id(sensor_puffer_unten).state) / 2.0f;
+      float t_max = ${puff_max_lad};
+      float t_basis = 18.0f; 
+      if (t_mittel <= t_basis) return 0.0f;
+      if (t_mittel >= t_max) return 100.0f;
+      return ((t_mittel - t_basis) / (t_max - t_basis)) * 100.0f;   
+
+  # --- Mathematische Leistungssensoren (kW) ---
+  - platform: template
+    name: "Heizleistung"
+    id: leistung_kessel
+    unit_of_measurement: "kW"
+    accuracy_decimals: 2
+    icon: "mdi:fire"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 14        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(ak2_tasmota).state) return 0.0f;
+      if (!id(sensor_kessel).has_state() || !id(sensor_hk_rl).has_state()) return {};
+      float dt = id(sensor_kessel).state - id(sensor_hk_rl).state;
+      if (dt < 0.0f) dt = 0.0f;
+      return (${mitt_durchfl} * 4.182f * dt) / 3600.0f;
+
+  - platform: template
+    name: "Solarüberschuss"
+    id: leistung_solaruewerschuss
+    unit_of_measurement: "kW"
+    accuracy_decimals: 2
+    icon: "mdi:solar-power"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 15        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(relais_1).state) return 0.0f;
+      if (!id(sensor_brauchwasser).has_state() || !id(sensor_puffer_unten).has_state()) return {};
+      float dt = id(sensor_brauchwasser).state - id(sensor_puffer_unten).state;
+      if (dt < 0.0f) dt = 0.0f;
+      return (${mitt_durchfl} * 4.182f * dt) / 3600.0f;
+
+  - platform: template
+    name: "Heizkreis-Entladeleistung"
+    id: leistung_hk_gesamt
+    unit_of_measurement: "kW"
+    accuracy_decimals: 2
+    icon: "mdi:radiator"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 16        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(ak2_tasmota).state) return 0.0f;
+      if (!id(sensor_hk_vl).has_state() || !id(sensor_hk_rl).has_state()) return {};
+      float dt = id(sensor_hk_vl).state - id(sensor_hk_rl).state;
+      if (dt < 0.0f) dt = 0.0f;
+      return (${mitt_durchfl} * 4.182f * dt) / 3600.0f;
+
+  - platform: template
+    name: "Heizkreis Wohnen2"
+    id: leistung_hk2_wohnen
+    unit_of_measurement: "kW"
+    accuracy_decimals: 2
+    icon: "mdi:home-floor-1"
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 17        
+    update_interval: ${sensor_intval_time}
+    lambda: |-
+      if (!id(ak2_tasmota).state) return 0.0f;
+      if (!id(sensor_hk2_vl).has_state() || !id(sensor_hk2_rl).has_state()) return {};
+      float dt = id(sensor_hk2_vl).state - id(sensor_hk2_rl).state;
+      if (dt < 0.0f) dt = 0.0f;
+      return (${woh2_mitt_durchfluss} * 4.182f * dt) / 3600.0f;
+
+  - platform: wifi_signal
+    name: "WLAN Signalstärke"
+    web_server:
+      sorting_group_id: group_system
+      sorting_weight: 95        
+
+# --- AKTOREN & SCHALTER ---
+switch:
+  - platform: template
+    name: "Feuerungsfreigabe (Kessel) Automatik"
+    id: ui_feuerungsfreigabe
+    icon: "mdi:fire"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 28        
+    turn_on_action:
+      - logger.log: "Kessel-Automatik freigegeben."
+    turn_off_action:
+      - logger.log: "Kessel-Automatik gesperrt (Not-Aus)."
+        
+  - platform: gpio
+    pin:
+      number: ${pin_relais_1}
+      inverted: ${relais_invertiert}
+    id: relais_1
+    internal: true 
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - binary_sensor.template.publish:
+          id: status_relais_1
+          state: !lambda "return x;"
+
+  - platform: gpio
+    pin:
+      number: ${pin_relais_2}
+      inverted: ${relais_invertiert}
+    id: relais_2
+    internal: true 
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - binary_sensor.template.publish:
+          id: status_relais_2
+          state: !lambda "return x;"
+          
+  - platform: gpio
+    pin:
+      number: ${pin_relais_3}
+      inverted: ${relais_invertiert}
+    id: relais_3
+    internal: true 
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - binary_sensor.template.publish:
+          id: status_relais_3
+          state: !lambda "return x;"
+          
+  # Handbetrieb
+  - platform: template
+    name: ${relais_1_name}
+    id: ui_relais_1
+    icon: "mdi:pump"
+    optimistic: true
+    web_server:
+      sorting_group_id: group_manual
+      sorting_weight: 31        
+    turn_on_action:
+      - switch.turn_off: automatik_freigabe 
+      - switch.turn_on: relais_1            
+    turn_off_action:
+      - switch.turn_off: relais_1           
+      - switch.turn_on: automatik_freigabe  
+
+  - platform: template
+    name: ${relais_2_name}
+    id: ui_relais_2
+    icon: "mdi:heating-coil"
+    optimistic: true
+    web_server:
+      sorting_group_id: group_manual
+      sorting_weight: 32        
+    turn_on_action:
+      - switch.turn_off: automatik_freigabe
+      - switch.turn_on: relais_2            
+    turn_off_action:
+      - switch.turn_off: relais_2           
+      - switch.turn_on: automatik_freigabe  
+        
+  - platform: template
+    name: "${relais_3_name} Handbetrieb (Test)" 
+    id: ui_feuerungsfreigabe_manu
+    icon: "mdi:fire"                      
+    optimistic: true
+    web_server:
+      sorting_group_id: group_manual
+      sorting_weight: 33                  
+    turn_on_action:
+      - switch.turn_off: automatik_freigabe 
+      - switch.turn_on: relais_3            
+    turn_off_action:
+      - switch.turn_off: relais_3           
+      - switch.turn_on: automatik_freigabe  
+
+  - platform: template
+    name: ${tasmota_realname}
+    id: ak2_tasmota
+    icon: "mdi:power-socket-de"
+    optimistic: true
+    web_server:
+      sorting_group_id: group_manual
+      sorting_weight: 34  
+    turn_on_action:
+      - if:
+          condition:
+            - switch.is_off: winterbetrieb_schalter
+          then:
+            - switch.turn_off: automatik_freigabe
+      - http_request.get: "http://${tasmota_ip_fest}/cm?cmnd=Power%20On"
+    turn_off_action:
+      - http_request.get: "http://${tasmota_ip_fest}/cm?cmnd=Power%20Off"
+      - if:
+          condition:
+            - switch.is_off: winterbetrieb_schalter
+          then:
+            - switch.turn_on: automatik_freigabe
+
+  - platform: template
+    name: "Automatikbetrieb aktiv"
+    id: automatik_freigabe
+    icon: "mdi:robot"
+    optimistic: true
+    restore_mode: ALWAYS_ON  
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 25        
+    turn_on_action:
+      - lambda: id(automatik_freigabe).publish_state(true);
+    turn_off_action:
+      - lambda: id(automatik_freigabe).publish_state(false);
+
+  - platform: template
+    name: "Regelung Aktiv"
+    id: regelung_aktiv
+    icon: "mdi:power"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 26        
+    turn_on_action:
+      - lambda: id(regelung_aktiv).publish_state(true);
+    turn_off_action:
+      - lambda: id(regelung_aktiv).publish_state(false);
+
+  - platform: template
+    name: "Übergang=Links Winter=Rechts"
+    id: winterbetrieb_schalter
+    icon: "mdi:snowflake"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: group_main
+      sorting_weight: 27        
+    turn_on_action:
+      - http_request.get: "http://${tasmota_ip_fest}/cm?cmnd=Power%20On"
+      - lambda: id(ak2_tasmota).publish_state(true);
+      - logger.log: "System wechselt in den WINTERBETRIEB..."
+    turn_off_action:
+      - http_request.get: "http://${tasmota_ip_fest}/cm?cmnd=Power%20Off"
+      - lambda: id(ak2_tasmota).publish_state(false);
+      - logger.log: "System wechselt in den ÜBERGANGSBETRIEB..."
+
+# --- BLOCK 3: ⚙️ EINSTELLUNGEN ---
+number:
+  - platform: template
+    name: "Duschwasser Mindestwert Morgens"
+    id: brauchwasser_min
+    optimistic: true
+    min_value: 40.0
+    max_value: 70.0
+    step: 1.0
+    initial_value: 54.0
+    unit_of_measurement: "°C"
+    restore_value: true
+    mode: box
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 61        
+
+  - platform: template
+    name: "Puffer Leer-Grenze Morgens"
+    id: puffer_min_ausschalt
+    optimistic: true
+    min_value: 15.0
+    max_value: 40.0
+    step: 1.0
+    initial_value: 25.0
+    unit_of_measurement: "°C"
+    restore_value: true
+    mode: box
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 62        
+
+  - platform: template
+    name: "Umlade-Differenz EIN Hysterese"
+    id: diff_ein
+    optimistic: true
+    min_value: 3.0
+    max_value: 20.0
+    step: 0.5
+    initial_value: 8.0
+    unit_of_measurement: "°K"
+    restore_value: true
+    mode: box
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 63        
+
+  - platform: template
+    name: "Umlade-Differenz AUS Hysterese"
+    id: diff_aus
+    optimistic: true
+    min_value: 0.5
+    max_value: 10.0
+    step: 0.5
+    initial_value: 4.0
+    unit_of_measurement: "°K"
+    restore_value: true
+    mode: box
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 64        
+
+# --- BLOCK 4: 🛠️ SYSTEMSTEUERUNG ---
+button:
+  - platform: restart
+    name: "System-Neustart Reboot"
+    id: system_reboot
+    icon: "mdi:restart"
+    web_server:
+      sorting_group_id: group_system
+      sorting_weight: 91  
+
+  - platform: template
+    name: "Störung quittieren (Sensor-Reset)"
+    id: sensor_fault_reset
+    icon: "mdi:alert-check"
+    web_server:
+      sorting_group_id: group_setup
+      sorting_weight: 79        
+    on_press:
+      then:
+        - lambda: |-
+            id(sensor_reboot_count) = 0;
+            id(sensor_hard_fault) = false;
+            ESP_LOGW("sensor_check", "Manueller Fehler-Reset ausgelöst. Setze Zähler zurück...");
+        - text_sensor.template.publish:
+            id: heizung_statusmeldung
+            state: "Prüfe Sensoren nach Reset..."
+        - script.execute: pruefe_hauptsensoren
+      
+# --- SKRIPT (PLUG & PLAY ERWEITERT OHNE AUTOMATISCHE REBOOT-SCHLEIFE) ---
+script:
+  - id: pruefe_hauptsensoren
+    then:
+      - delay: 20s          
+      - lambda: |-
+          bool kern_da = id(sensor_brauchwasser).has_state() && 
+                         id(sensor_puffer_oben).has_state() && 
+                         id(sensor_puffer_unten).has_state();
+
+          if (kern_da) {
+            id(sensor_reboot_count) = 0;
+            id(sensor_hard_fault) = false;
+            ESP_LOGI("sensor_check", "Kernsensoren erfolgreich erkannt. Betrieb läuft.");
+          } else {
+            id(sensor_reboot_count)++;
+            ESP_LOGE("sensor_check", "Sensor fehlt beim Tausch! Versuch %d von 3", id(sensor_reboot_count));
+
+            if (id(sensor_reboot_count) < 3) {
+              ESP_LOGW("sensor_check", "Warte auf Sensor-Stabilisierung (Fehler im Webmenü quittieren)");
+            } else {
+              id(sensor_hard_fault) = true;
+              ESP_LOGE("sensor_check", "CRITICAL: Sensor dauerhaft getrennt. Bitte Fühler prüfen!");
+            }
+          }
+          
+# ===================================================================================
+# CORESYSTEM-REGLER: MATHE-GESTEUERTE HYDRAULIKLOGIK (MIT PUFFER-WARTELOGIK)
+# ===================================================================================
+interval:
+  - interval: ${regel_takt}
+    then:
+      - lambda: |-
+          // =================================================================
+          // DYNAMISCHE FLANKENERKENNUNG FÜR DIE PUMPEN-MINDESTLAUFZEIT
+          // =================================================================
+          static uint32_t pumpe_gestartet_am = 0;
+          static bool pumpe_war_an = false;
+          uint32_t jetzt = millis();
+
+          if (id(relais_1).state && !pumpe_war_an) {
+            pumpe_gestartet_am = jetzt;
+            pumpe_war_an = true;
+          } 
+          else if (!id(relais_1).state) {
+            pumpe_war_an = false;
+          }
+
+          bool min_laufzeit_erreicht = (!pumpe_war_an) || (jetzt - pumpe_gestartet_am >= ${pumpe_min_on_ms});
+
+          // Live-Aktualisierung der Status-Bits für die Weboberfläche
+          id(status_relais_1).publish_state(id(relais_1).state);
+          id(status_relais_2).publish_state(id(relais_2).state);
+          id(status_relais_3).publish_state(id(relais_3).state);
+          id(status_tasmota).publish_state(id(ak2_tasmota).state);
+
+          // 1. HARDWARE-NOT-AUS: Wenn Sensoren defekt sind, ALLES HART AUSSCHALTEN
+          if (id(sensor_hard_fault)) {
+            id(relais_1).turn_off();
+            id(relais_2).turn_off();
+            id(relais_3).turn_off();
+            if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off();
+            return; 
+          }
+
+          // 2. HANDBETRIEB-SCHUTZ: Wenn Automatik in der UI aus ist, abbrechen
+          if (!id(automatik_freigabe).state) {
+            return;
+          }
+
+          // 3. REGELUNG KOMPLETT AUS -> Alle Ausgänge hart abschalten
+          if (!id(regelung_aktiv).state) {
+            id(relais_1).turn_off();                               
+            id(relais_2).turn_off();                               
+            id(relais_3).turn_off(); 
+            if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off(); 
+            return; 
+          }
+
+          // =================================================================
+          // STRATEGISCHE FEUERUNGSFREIGABE (MIT STRENGER 45°C WARTE-LOGIK)
+          // =================================================================
+          if (id(sensor_puffer_oben).has_state() && id(sensor_kessel).has_state()) {
+            float t_puf_ob_aktuell = id(sensor_puffer_oben).state;
+            float t_kes_aktuell    = id(sensor_kessel).state;
+            
+            float ein_grenze       = ${win_puff_ob};   // 45 °C (Einschalt-Schwelle)
+            float aus_grenze       = ${puff_max_lad};  // 75 °C (Ausschalt-Schwelle)
+            float kessel_heiss     = 50.0f;            // Kessel brennt aktiv
+            float kessel_ausgebrannt = 45.0f;          // Kessel physikalisch kalt
+
+            // Wenn der User die Automatik in der UI ausgeschaltet hat -> Sofort aus
+            if (!id(ui_feuerungsfreigabe).state) {
+              if (id(relais_3).state) {
+                id(relais_3).turn_off();
+                ESP_LOGI("feuerung", "USER-STOPP: Anzündanforderung entzogen.");
+              }
+            } 
+            else {
+              // SCHUTZ-SZENARIO 1: Puffer oben hat 75 °C erreicht -> AUSBRAND & UI-SPERRE (AUS)
+              if (t_puf_ob_aktuell >= aus_grenze) {
+                if (id(relais_3).state || id(ui_feuerungsfreigabe).state) {
+                  id(relais_3).turn_off();             // Relais öffnen -> Ausbrandphase
+                  id(ui_feuerungsfreigabe).turn_off(); // Schalter in der UI sperren (Verriegelung)
+                  ESP_LOGW("feuerung", "AUSBRAND: Puffer voll (%0.1f°C). Relais 3 geöffnet und verriegelt.", t_puf_ob_aktuell);
+                }
+              }
+              // SCHUTZ-SZENARIO 2: Puffer ist noch warm (über 45 °C)
+              else if (t_puf_ob_aktuell >= ein_grenze && t_puf_ob_aktuell < aus_grenze) {
+                
+                if (id(relais_3).state) {
+                  // Wenn das Relais bereits läuft (Abbrand aktiv), bleibt es an bis 75 °C erreicht sind!
+                  ESP_LOGD("feuerung", "ABBRAND AKTIV: Puffer oben bei %0.1f°C. Relais bleibt geschlossen.", t_puf_ob_aktuell);
+                } 
+                else {
+                  // Wenn das Relais aus war (Szenario B): Prüfe, ob du manuell angeheizt hast
+                  if (t_kes_aktuell >= kessel_heiss) {
+                    // Kessel ist heiß (> 50°C), das bedeutet du hast manuell angeheizt -> REBOOT-RESTORE / START!
+                    id(relais_3).turn_on();
+                    ESP_LOGW("feuerung", "START: Kessel ist heiß (%0.1f°C). Anforderung aktiviert.", t_kes_aktuell);
+                  } else {
+                    // Kessel ist kalt und Puffer ist warm -> REGELUNG WARTET AKTIV!
+                    ESP_LOGI("feuerung", "WARTE-MODUS: Schalter ist EIN, aber Regelung wartet aktiv, bis Puffer unter 45°C fällt (Aktuell: %0.1f°C).", t_puf_ob_aktuell);
+                  }
+                }
+              }
+              // SCHUTZ-SZENARIO 3: Puffer oben hat die 45 °C unterschritten -> START-FREIGABE
+              else if (t_puf_ob_aktuell < ein_grenze) {
+                
+                if (id(ui_feuerungsfreigabe).state) {
+                  if (!id(relais_3).state) {
+                    // Puffer ist unter 45°C gefallen -> Jetzt schaltet das Relais 3 endlich ein!
+                    id(relais_3).turn_on();
+                    ESP_LOGW("feuerung", "START-FREIGABE: Puffer unter 45°C gefallen (%0.1f°C). Relais 3 geschlossen!", t_puf_ob_aktuell);
+                  }
+                }
+              }
+            }
+          }
+
+          // =================================================================
+          // FALL 2: WINTERZEIT (Rein temperaturgeführt für Ladepumpe)
+          // =================================================================
+          if (id(winterbetrieb_schalter).state) {
+            if (!id(ak2_tasmota).state) id(ak2_tasmota).turn_on();
+
+            if (!id(sensor_brauchwasser).has_state() || !id(sensor_puffer_oben).has_state()) {
+              if (id(relais_1).state && min_laufzeit_erreicht) id(relais_1).turn_off();
+              id(relais_2).turn_off();
+              return;
+            }
+
+            float t_bw = id(sensor_brauchwasser).state;
+            float t_puf_ob = id(sensor_puffer_oben).state;
+            float winter_diff = t_puf_ob - t_bw;
+
+            if (t_bw >= ${bw_max_lad} || (t_puf_ob < ${win_puff_ob} && winter_diff < id(diff_ein).state)) {
+              if (id(relais_1).state && min_laufzeit_erreicht) {
+                id(relais_1).turn_off();
+                id(winter_pause_restzeit).publish_state(t_bw >= ${bw_max_lad} ? "Warm genug" : "Puffer kalt");
+              }
+              id(relais_2).turn_off();
+              return;
+            }
+
+            if (!id(relais_1).state && t_puf_ob >= ${win_puff_ob} && winter_diff >= id(diff_ein).state) {
+              id(relais_1).turn_on();
+              id(winter_pause_restzeit).publish_state("Ladung active");
+            } 
+            else if (id(relais_1).state && winter_diff <= id(diff_aus).state) {
+              if (min_laufzeit_erreicht) {
+                id(relais_1).turn_off();
+                id(winter_pause_restzeit).publish_state("Bereit (Hysterese)");
+              }
+            }
+
+            id(relais_2).turn_off();
+            return; 
+          }
+          
+          // =================================================================
+          // FALL 3: ÜBERGANGSZEIT
+          // =================================================================
+          if (!id(sensor_brauchwasser).has_state() || !id(sensor_puffer_oben).has_state() || !id(sensor_puffer_unten).has_state()) {
+            id(relais_1).turn_off(); 
+            id(relais_2).turn_off();
+            if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off();
+            return;
+          }
+
+          float t_bw      = id(sensor_brauchwasser).state;  
+          float t_puf_ob  = id(sensor_puffer_oben).state;   
+          float t_puf_unt = id(sensor_puffer_unten).state;  
+          
+          float bw_min_crit  = id(brauchwasser_min).state;        
+          float puf_min_crit = id(puffer_min_ausschalt).state;    
+          float puf_max_crit = ${puffer_max_wert};                
+
+          auto time_now = id(sntp_time).now();
+          int aktuelle_minuten = (time_now.hour * 60) + time_now.minute;
+
+          int lade_von    = id(lade_von_min);
+          int lade_bis    = id(lade_bis_min);
+          int entlade_von = id(entlade_von_min);
+          int entlade_bis = id(entlade_bis_min);
+
+          // ROUTINE 1: MORGENDLICHE HEIZKREIS-ENTLADUNG (05:30 - 07:30 Uhr)
+          bool entladefenster_aktiv = (time_now.is_valid() && aktuelle_minuten >= entlade_von && aktuelle_minuten < entlade_bis);
+
+          if (entladefenster_aktiv) {
+            id(relais_1).turn_off(); 
+
+            if (t_bw >= bw_min_crit && t_puf_unt >= puf_min_crit) {
+              if (!id(ak2_tasmota).state) id(ak2_tasmota).turn_on(); 
+              id(relais_2).turn_on();                                
+            } 
+            else {
+              if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off(); 
+              id(relais_2).turn_off();                               
+            }
+            return; 
+          }
+          
+          // ROUTINE 2: MITTÄGLICHE SOLAR-UMLADUNG (Brauchwasser -> Puffer)
+          bool ladefenster_aktiv = (time_now.is_valid() && aktuelle_minuten >= lade_von && aktuelle_minuten < lade_bis);
+
+          if (ladefenster_aktiv) {
+            if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off(); 
+            id(relais_2).turn_off();                               
+
+            if (t_puf_ob < puf_max_crit) {
+              float umschicht_ertrag = t_bw - t_puf_unt; 
+
+              if (!id(relais_1).state && umschicht_ertrag >= id(diff_ein).state) {
+                id(relais_1).turn_on(); 
+              }
+              else if (id(relais_1).state && umschicht_ertrag < id(diff_aus).state) {
+                if (min_laufzeit_erreicht) id(relais_1).turn_off();
+              }
+            } 
+            else {
+              if (id(relais_1).state && min_laufzeit_erreicht) id(relais_1).turn_off();
+            }
+            return; 
+          }
+          
+          // ROUTINE 3: STANDBY AUẞERHALB DER STEUERZEITEN
+          id(relais_1).turn_off();
+          id(relais_2).turn_off();
+          if (id(ak2_tasmota).state) id(ak2_tasmota).turn_off();
